@@ -34,8 +34,8 @@ class KumoTabularModel(AbstractTorchModel):
 
     ``fit`` fits the preprocessing recipe and records the context KV cache. ``predict`` reuses both in
     query-row batches, under float16 autocast on CUDA. The recipe computes numerical statistics in
-    float64. ``estimator_batch_size`` and ``ag.max_batch_size`` default to conservative memory-based
-    estimates; positive integer overrides fix either size. These estimates are not an OOM guarantee:
+    float64. ``estimator_batch_size`` defaults to a cell budget and ``ag.max_batch_size`` to a conservative
+    memory-based estimate; positive integer overrides fix either size. These estimates are not an OOM guarantee:
     fitting still preprocesses the full context and stores the ensemble's KV cache in host memory.
     ``max_context_size`` (default 200,000) caps the context rows per estimator: larger training sets
     give each estimator its own random subsample of that size. ``None`` uses all rows.
@@ -114,15 +114,13 @@ class KumoTabularModel(AbstractTorchModel):
             y_context = y_context[indices].unflatten(0, shape)
             num_estimators = None
             logger.info("\tKumo context subsampled from %s to %s rows per estimator", len(X), max_context_size)
-        self._row_bytes, cache_bytes = _estimators.row_bytes(network, X.shape[1], self.num_classes or 0)
+        self._row_bytes = _estimators.row_bytes(network, X.shape[1], self.num_classes or 0)
         batch_size = params["estimator_batch_size"]
         if batch_size is None:
-            batch_size = 1
-            if device.type == "cuda":
-                budget = _estimators.available_memory(device) // 2
-                batch_size = max(
-                    1, min(self._num_estimators, budget // (context_size * (self._row_bytes + cache_bytes)))
-                )
+            num_categorical = sum(stype == sdm.Stype.categorical for stype in self._stypes.values())
+            batch_size = _estimators.estimator_batch_size(
+                self._num_estimators, context_size, X.shape[1], num_categorical, self.num_classes or 0
+            )
         self._estimator_batch_size = batch_size
         logger.info("\tKumo estimator batch size: %s", batch_size)
         estimator = self.model.estimator()

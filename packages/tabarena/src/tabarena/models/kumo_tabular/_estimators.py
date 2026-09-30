@@ -108,8 +108,8 @@ def available_memory(device: torch.device) -> int:
     return max(0, int(min(free + reusable, limit)))
 
 
-def row_bytes(network: torch.nn.Module, num_columns: int, num_classes: int) -> tuple[int, int]:
-    """Conservative FP16 model workspace and fit-cache bytes per row and estimator.
+def row_bytes(network: torch.nn.Module, num_columns: int, num_classes: int) -> int:
+    """Conservative FP16 model workspace bytes per row and estimator.
 
     This mirrors the pinned Kumo architecture, not a measured peak: four cell-sized buffers plus the
     attention block's 15x workspace allowance. ECOC repeats the network for each codebook task.
@@ -118,8 +118,20 @@ def row_bytes(network: torch.nn.Module, num_columns: int, num_classes: int) -> t
     columns = min(2 * num_columns, 500)
     row = network.row_embedding
     icl = network.icl_block
-    tasks = max(math.ceil(num_classes / 9), 4 * math.ceil(math.log(num_classes, 10))) if num_classes > 10 else 1
-    workspace = tasks * 2 * (4 * (columns + row.readout_token.size(0)) * row.channels + 15 * icl.layers[0].attn.q_dim)
-    # Fit projects all attention heads before retaining the smaller query KV heads.
-    cache = tasks * 2 * 2 * icl.layers[0].attn.q_dim * len(icl.layers)
-    return workspace, cache
+    tasks = ecoc_tasks(num_classes)
+    return tasks * 2 * (4 * (columns + row.readout_token.size(0)) * row.channels + 15 * icl.layers[0].attn.q_dim)
+
+
+def ecoc_tasks(num_classes: int) -> int:
+    """Codebook tasks the network runs for ``num_classes`` classes (one up to 10 classes)."""
+    return max(math.ceil(num_classes / 9), 4 * math.ceil(math.log(num_classes, 10))) if num_classes > 10 else 1
+
+
+def estimator_batch_size(num_estimators: int, rows: int, columns: int, categorical: int, num_classes: int) -> int:
+    """Estimators fit together within 2**20 cells: rows x (model columns + 32) x ECOC tasks each.
+
+    The recipe adds at most one count column per categorical column and keeps at most 500. The
+    column-block KV cache of every recorded estimator grows with its columns and ECOC tasks, not its rows.
+    """
+    cells = rows * (min(columns + categorical, 500) + 32) * ecoc_tasks(num_classes)
+    return max(1, min(num_estimators, 2**20 // cells))
