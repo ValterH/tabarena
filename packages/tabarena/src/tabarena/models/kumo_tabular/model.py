@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
@@ -36,6 +37,8 @@ class KumoTabularModel(AbstractTorchModel):
     float64. ``estimator_batch_size`` and ``ag.max_batch_size`` default to conservative memory-based
     estimates; positive integer overrides fix either size. These estimates are not an OOM guarantee:
     fitting still preprocesses the full context and stores the ensemble's KV cache in host memory.
+    ``max_context_size`` (default 200,000) caps the context rows per estimator: larger training sets
+    give each estimator its own random subsample of that size. ``None`` uses all rows.
     """
 
     ag_key = "TA-KUMO-TABULAR"
@@ -95,16 +98,33 @@ class KumoTabularModel(AbstractTorchModel):
         params = self._get_model_params()
         self._num_cpus = num_cpus
         self._num_columns = X.shape[1]
+        generator = torch.Generator(device).manual_seed(self.random_seed) if isinstance(self.random_seed, int) else None
+        self._num_estimators = num_estimators = params["num_estimators"]
+        max_context_size = params["max_context_size"]
+        # Consecutive permutations, cut per estimator, keep the estimators' rows disjoint while they last.
+        self._expand_query = max_context_size is not None and len(X) > max_context_size
+        context_size = max_context_size if self._expand_query else len(X)
+        if self._expand_query:
+            num_repeats = math.ceil(num_estimators * max_context_size / len(X))
+            indices = torch.cat(
+                [torch.randperm(len(X), generator=generator, device=device) for _ in range(num_repeats)]
+            )[: num_estimators * max_context_size]
+            shape = (num_estimators, max_context_size)
+            x_context = x_context[indices].unflatten(0, shape)
+            y_context = y_context[indices].unflatten(0, shape)
+            num_estimators = None
+            logger.info("\tKumo context subsampled from %s to %s rows per estimator", len(X), max_context_size)
         self._row_bytes, cache_bytes = _estimators.row_bytes(network, X.shape[1], self.num_classes or 0)
         batch_size = params["estimator_batch_size"]
         if batch_size is None:
             batch_size = 1
             if device.type == "cuda":
                 budget = _estimators.available_memory(device) // 2
-                batch_size = max(1, min(params["num_estimators"], budget // (len(X) * (self._row_bytes + cache_bytes))))
+                batch_size = max(
+                    1, min(self._num_estimators, budget // (context_size * (self._row_bytes + cache_bytes)))
+                )
         self._estimator_batch_size = batch_size
         logger.info("\tKumo estimator batch size: %s", batch_size)
-        generator = torch.Generator(device).manual_seed(self.random_seed) if isinstance(self.random_seed, int) else None
         estimator = self.model.estimator()
         previous_threads = torch.get_num_threads()
         try:
@@ -116,7 +136,7 @@ class KumoTabularModel(AbstractTorchModel):
                 estimator.fit(
                     x=x_context,
                     y=y_context,
-                    num_estimators=params["num_estimators"],
+                    num_estimators=num_estimators,
                     estimator_batch_size=batch_size,
                     generator=generator,
                 )
@@ -165,6 +185,8 @@ class KumoTabularModel(AbstractTorchModel):
                 torch.amp.autocast(device.type, dtype=torch.float16, enabled=device.type == "cuda"),
             ):
                 query = sdm.TableTensor.from_pandas(df=X, stypes=self._stypes, device=device)
+                if self._expand_query:
+                    query = query.expand(self._num_estimators, *query.size())
                 out = estimator.predict(query)
                 if self.problem_type == REGRESSION:
                     return out.numerical.float().mean(dim=-1).cpu().numpy()
@@ -179,6 +201,7 @@ class KumoTabularModel(AbstractTorchModel):
     def _set_default_params(self):
         self._set_default_param_value("num_estimators", self.default_num_estimators)
         self._set_default_param_value("estimator_batch_size", None)
+        self._set_default_param_value("max_context_size", 200_000)
 
     def get_device(self) -> str:
         param = next(self.model.network.parameters(), None)
